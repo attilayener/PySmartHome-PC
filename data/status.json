@@ -1,33 +1,33 @@
 {
   "schema_version": 3,
-  "generated_at": "2026-10-04T01:53:37+03:30",
+  "generated_at": "2026-10-04T01:58:37+03:30",
   "timezone": "Asia/Tehran",
   "nodes": {
     "esp32_1": {
       "name": "Room 1 • Hub",
       "online": true,
       "temperature": 27.4,
-      "humidity": 43.1,
-      "last_seen": "2026-10-04T01:53:37+03:30",
-      "latency_ms": 115,
-      "samples": 13100,
+      "humidity": 42.7,
+      "last_seen": "2026-10-04T01:58:36+03:30",
+      "latency_ms": 39,
+      "samples": 13130,
       "consecutive_failures": 0
     },
     "esp32_s3": {
       "name": "Room 2 • Sensor S3",
       "online": true,
-      "temperature": 27.5,
-      "humidity": 41.4,
-      "last_seen": "2026-10-04T01:53:37+03:30",
+      "temperature": 27.4,
+      "humidity": 40.7,
+      "last_seen": "2026-10-04T01:58:37+03:30",
       "latency_ms": 101,
-      "samples": 13101,
+      "samples": 13131,
       "consecutive_failures": 0
     }
   },
   "server": {
-    "uptime_seconds": 133013,
-    "last_poll": "2026-10-04T01:53:37+03:30",
-    "last_publish": "2026-10-04T01:48:43+03:30",
+    "uptime_seconds": 133313,
+    "last_poll": "2026-10-04T01:58:37+03:30",
+    "last_publish": "2026-10-04T01:53:43+03:30",
     "publish_ok": true
   },
   "thresholds": {
