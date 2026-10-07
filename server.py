@@ -2,7 +2,7 @@
 """PySmartHome-PC - resilient local smart-home dashboard server.
 
 One shared frontend is served locally and also committed to GitHub Pages.
-The `data/` directory is the only runtime data directory.
+The data/ directory is the only runtime data directory.
 """
 from __future__ import annotations
 
@@ -15,11 +15,13 @@ import math
 import os
 import threading
 import time
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
 
 import requests
 from flask import Flask, jsonify, request, send_from_directory
+from flask_socketio import SocketIO, emit
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
@@ -44,20 +46,39 @@ ESP32_S3_URL = os.getenv("PYSMART_ESP32_S3_URL", "http://192.168.1.115/api/statu
 GITHUB_USER = os.getenv("PYSMART_GITHUB_USER", "mehrdadmb2")
 GITHUB_REPO = os.getenv("PYSMART_GITHUB_REPO", "PySmartHome-PC")
 GITHUB_BRANCH = os.getenv("PYSMART_GITHUB_BRANCH", "main")
-GITHUB_TOKEN = os.getenv("PYSMART_GITHUB_TOKEN", "").strip()
+
+
+def load_github_token() -> str:
+    \"\"\"Load GitHub token from config.txt or environment variable.\"\"\"
+    config_file = BASE_DIR / "config.txt"
+    if config_file.exists():
+        try:
+            for line in config_file.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if line.startswith("token "):
+                    token_value = line.split(" ", 1)[1].strip()
+                    if token_value:
+                        return token_value
+        except OSError:
+            pass
+    return os.getenv("PYSMART_GITHUB_TOKEN", "").strip()
+
+
+GITHUB_TOKEN = load_github_token()
+
+# API Authentication
+API_KEY = os.getenv("PYSMART_API_KEY", "").strip()
+PROTECTED_ENDPOINTS = {"/api/upload", "/api/delete", "/api/outage/update"}
 
 BOARDS = {
     "esp32_1": {"name": "Room 1 • Hub", "short": "Room 1", "url": ESP32_HUB_URL},
     "esp32_s3": {"name": "Room 2 • Sensor S3", "short": "Room 2", "url": ESP32_S3_URL},
 }
 
-# Iran uses UTC+03:30. This fixed offset is intentional: it avoids host OS
-# timezone database differences and matches current Iran civil time.
 IRAN_TZ = dt.timezone(dt.timedelta(hours=3, minutes=30), "Asia/Tehran")
 OUTAGE_FILE = DATA_DIR / "outage_schedule.json"
 STATUS_FILE = DATA_DIR / "status.json"
 
-# Outages are 2 hours, on a rolling 09:00..21:00 six-slot cycle.
 SLOTS = (9, 11, 13, 15, 17, 19)
 OUTAGE_DURATION_MINUTES = 120
 SKIP_WEEKDAY = 4  # Friday
@@ -66,11 +87,11 @@ SKIP_WEEKDAY = 4  # Friday
 class ColorFormatter(logging.Formatter):
     RESET = "\033[0m"
     COLORS = {
-        logging.DEBUG: "\033[36m",   # cyan
-        logging.INFO: "\033[92m",    # green
-        logging.WARNING: "\033[93m",# yellow
-        logging.ERROR: "\033[91m",  # red
-        logging.CRITICAL: "\033[95m",# magenta
+        logging.DEBUG: "\033[36m",
+        logging.INFO: "\033[92m",
+        logging.WARNING: "\033[93m",
+        logging.ERROR: "\033[91m",
+        logging.CRITICAL: "\033[95m",
     }
 
     def format(self, record: logging.LogRecord) -> str:
@@ -81,12 +102,23 @@ class ColorFormatter(logging.Formatter):
         message = super().format(record)
         return f"{color}[{level}]\033[0m {stamp} │ \033[96m[{category}]\033[0m {message}"
 
-handler = logging.StreamHandler()
-handler.setFormatter(ColorFormatter("%(message)s"))
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(ColorFormatter("%(message)s"))
+
+log_file = BASE_DIR / "pysmarthome.log"
+file_handler = RotatingFileHandler(
+    log_file,
+    maxBytes=5*1024*1024,
+    backupCount=3,
+    encoding="utf-8"
+)
+file_handler.setFormatter(ColorFormatter("%(message)s"))
+
 logger = logging.getLogger("pysmarthome")
 logger.setLevel(os.getenv("PYSMART_LOG_LEVEL", "INFO").upper())
 logger.handlers.clear()
-logger.addHandler(handler)
+logger.addHandler(console_handler)
+logger.addHandler(file_handler)
 logger.propagate = False
 
 # ----------------------------- state ----------------------------------------
@@ -174,9 +206,9 @@ def date_range_for(name: str, end_date: dt.date) -> list[dt.date]:
         raise ValueError("invalid range")
     return [end_date - dt.timedelta(days=o) for o in offsets]
 
+
 # --------------------------- outage engine ----------------------------------
 def default_schedule() -> dict[str, dict[str, str]]:
-    """Seed the cycle around today: today = 13:00-15:00, Fridays = none."""
     ref = today()
     return generate_schedule(ref, 13, span=14)
 
@@ -209,12 +241,6 @@ def save_outage(schedule: dict[str, dict[str, str]]) -> None:
 
 
 def generate_schedule(reference_date: dt.date, reference_start_hour: int, span: int = 21) -> dict[str, dict[str, str]]:
-    """Generate both past and future slots from one reference slot.
-
-    The cycle advances one slot per non-Friday day. Friday has no outage and
-    does not consume a slot. After 19:00-21:00 the next non-Friday slot wraps
-    to 09:00-11:00.
-    """
     if reference_start_hour not in SLOTS:
         raise ValueError("reference start must be one of 09,11,13,15,17,19")
     ref_index = SLOTS.index(reference_start_hour)
@@ -223,14 +249,13 @@ def generate_schedule(reference_date: dt.date, reference_start_hour: int, span: 
         day = reference_date + dt.timedelta(days=offset)
         if day.weekday() == SKIP_WEEKDAY:
             continue
-        # Count non-Friday days between reference and target, excluding reference itself.
         step = 1 if offset >= 0 else -1
         shift = 0
         cursor = reference_date
         for _ in range(abs(offset)):
             cursor += dt.timedelta(days=step)
-            if cursor.weekday() != SKIP_WEEKDAY:
-                shift += step
+        if cursor.weekday() != SKIP_WEEKDAY:
+            shift += step
         slot = SLOTS[(ref_index + shift) % len(SLOTS)]
         result[day.isoformat()] = {"start": f"{slot:02d}:00", "end": f"{slot + 2:02d}:00"}
     return result
@@ -244,11 +269,8 @@ def ensure_outage_schedule() -> None:
             save_outage(outage_schedule)
             logger.info("Outage cycle initialized: today 13:00–15:00", extra={"category": "OUTAGE"})
         else:
-            # Always keep a usable window around now. Prefer the latest stored
-            # reference for existing data, then generate any missing dates.
             today_key = today().isoformat()
-            if today_key not in outage_schedule and today().weekday() != SKIP_WEEKDAY:
-                # Derive today's slot from nearest stored non-Friday date.
+            for today_key not in outage_schedule and today().weekday() != SKIP_WEEKDAY:
                 nearest = min(
                     (k for k in outage_schedule if valid_date(k)),
                     key=lambda k: abs((dt.date.fromisoformat(k) - today()).days),
@@ -289,6 +311,7 @@ def update_outage_from_reference(date_value: str, start: str, end: str) -> dict[
         save_outage(outage_schedule)
     logger.info("Cycle recalculated from %s %s–%s", date_value, start, end, extra={"category": "OUTAGE"})
     return dict(outage_schedule)
+
 
 # --------------------------- CSV storage ------------------------------------
 def csv_path(board: str, date_value: str) -> Path:
@@ -340,6 +363,7 @@ def read_samples(board: str, date_value: str) -> list[dict[str, Any]]:
         logger.warning("Could not read %s: %s", path, exc, extra={"category": "DATA"})
     return rows
 
+
 # ---------------------------- sensor polling --------------------------------
 session = requests.Session()
 session.headers.update({"User-Agent": "PySmartHome-PC/3.0"})
@@ -382,11 +406,67 @@ def poll_board(board: str) -> None:
                 "consecutive_failures": 0,
             })
         logger.info("%s → %.2f°C / %.1f%% • %d ms", BOARDS[board]["name"], temperature, humidity, latency, extra={"category": "POLL"})
+        # Emit WebSocket event for real-time updates
+        socketio.emit('sensor_update', {
+            'board': board,
+            'temperature': temperature,
+            'humidity': humidity,
+            'latency_ms': latency,
+            'timestamp': iso_now()
+        }, namespace='/sensors')
+    except requests.Timeout:
+        with state_lock:
+            sensors[board]["last_error"] = "timeout"
+            sensors[board]["consecutive_failures"] += 1
+        logger.warning(
+            "%s timeout after %ds • consecutive_failures=%d",
+            BOARDS[board]["name"],
+            HTTP_TIMEOUT,
+            sensors[board]["consecutive_failures"],
+            extra={"category": "POLL"}
+        )
+    except requests.ConnectionError as exc:
+        with state_lock:
+            sensors[board]["last_error"] = str(exc)
+            sensors[board]["consecutive_failures"] += 1
+        logger.warning(
+            "%s connection error • consecutive_failures=%d",
+            BOARDS[board]["name"],
+            sensors[board]["consecutive_failures"],
+            extra={"category": "POLL"}
+        )
+    except requests.HTTPError as exc:
+        with state_lock:
+            sensors[board]["last_error"] = str(exc)
+            sensors[board]["consecutive_failures"] += 1
+        logger.warning(
+            "%s HTTP error %s • consecutive_failures=%d",
+            BOARDS[board]["name"],
+            exc.response.status_code if exc.response else "unknown",
+            sensors[board]["consecutive_failures"],
+            extra={"category": "POLL"}
+        )
+    except (ValueError, KeyError) as exc:
+        with state_lock:
+            sensors[board]["last_error"] = str(exc)
+            sensors[board]["consecutive_failures"] += 1
+        logger.error(
+            "%s invalid payload: %s • consecutive_failures=%d",
+            BOARDS[board]["name"],
+            exc,
+            sensors[board]["consecutive_failures"],
+            extra={"category": "POLL"}
+        )
     except Exception as exc:
         with state_lock:
             sensors[board]["last_error"] = str(exc)
             sensors[board]["consecutive_failures"] += 1
-        logger.warning("%s unavailable • %s", BOARDS[board]["name"], exc, extra={"category": "POLL"})
+        logger.exception(
+            "%s unexpected error • consecutive_failures=%d",
+            BOARDS[board]["name"],
+            sensors[board]["consecutive_failures"],
+            extra={"category": "POLL"}
+        )
 
 
 def poll_all() -> None:
@@ -396,6 +476,7 @@ def poll_all() -> None:
         runtime["last_poll"] = iso_now()
         runtime["poll_cycles"] += 1
 
+
 # ----------------------------- github sync ----------------------------------
 def github_enabled() -> bool:
     return bool(GITHUB_TOKEN)
@@ -403,7 +484,7 @@ def github_enabled() -> bool:
 
 def github_put(path: str, content: str, message: str) -> None:
     if not github_enabled():
-        raise RuntimeError("PYSMART_GITHUB_TOKEN is not configured")
+        raise RuntimeError("GitHub token is not configured")
     url = f"https://api.github.com/repos/{GITHUB_USER}/{GITHUB_REPO}/contents/{path}"
     headers = {
         "Accept": "application/vnd.github+json",
@@ -497,6 +578,7 @@ def publish_to_github_once() -> bool:
         logger.error("GitHub publish failed • %s", exc, extra={"category": "SYNC"})
         return False
 
+
 # ---------------------------- background worker -----------------------------
 def worker_loop() -> None:
     next_publish = 0.0
@@ -521,10 +603,31 @@ def start_worker() -> None:
     threading.Thread(target=worker_loop, name="pysmarthome-worker", daemon=True).start()
     logger.info("Background worker started • poll=%ss • publish=%ss", POLL_INTERVAL, PUBLISH_INTERVAL, extra={"category": "SYS"})
 
+
 # ------------------------------- flask --------------------------------------
 app = Flask(__name__)
+app.config['SECRET_KEY'] = os.getenv('PYSMART_SECRET_KEY', 'dev-secret-key-change-in-production')
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 
 ALLOWED_PUBLIC_FILES = {"index.html", "app.js", "style.css"}
+
+
+@app.before_request
+def check_api_auth():
+    if not API_KEY:
+        return None
+    if request.path in PROTECTED_ENDPOINTS:
+        provided_key = request.headers.get("X-API-Key", "")
+        if provided_key != API_KEY:
+            logger.warning(
+                "Unauthorized access attempt to %s from %s",
+                request.path,
+                request.remote_addr,
+                extra={"category": "AUTH"}
+            )
+            return jsonify({"error": "unauthorized", "message": "Invalid or missing X-API-Key header"}), 401
+    return None
+
 
 @app.after_request
 def headers(response):
@@ -552,6 +655,7 @@ def api_health():
         "timezone": "Asia/Tehran",
         "github_sync_enabled": github_enabled(),
         "worker_started": worker_started,
+        "api_auth_enabled": bool(API_KEY),
     })
 
 
@@ -648,7 +752,7 @@ def api_datetime():
         "timezone": "Asia/Tehran",
         "iso": now.isoformat(),
         "gregorian": now.strftime("%Y-%m-%d %H:%M:%S"),
-        "shamsi": None,  # frontend uses Intl Persian calendar with Latin digits
+        "shamsi": None,
     })
 
 
@@ -656,12 +760,43 @@ def api_datetime():
 def public_files(path: str):
     if path in ALLOWED_PUBLIC_FILES:
         return send_from_directory(BASE_DIR, path)
-    # Public data only; no arbitrary filesystem access.
     if path.startswith("data/"):
         relative = Path(path[5:])
         if relative.name and all(part not in {".", ".."} for part in relative.parts):
             return send_from_directory(DATA_DIR, relative.as_posix())
     return jsonify({"error": "not found"}), 404
+
+
+# ----------------------------- websocket events -----------------------------
+@socketio.on('connect', namespace='/sensors')
+def handle_connect():
+    logger.info("Client connected to WebSocket", extra={"category": "WS"})
+    emit('connected', {'message': 'Connected to PySmartHome-PC real-time updates'})
+
+
+@socketio.on('disconnect', namespace='/sensors')
+def handle_disconnect():
+    logger.info("Client disconnected from WebSocket", extra={"category": "WS"})
+
+
+@socketio.on('request_update', namespace='/sensors')
+def handle_request_update():
+    """Client requests current sensor data."""
+    with state_lock:
+        now_ts = time.time()
+        emit('sensor_update', {
+            'nodes': {
+                board: {
+                    "name": cfg["name"],
+                    "online": (now_ts - float(sensors[board]["last_seen_epoch"])) <= NODE_TIMEOUT,
+                    "temperature": sensors[board]["temperature"],
+                    "humidity": sensors[board]["humidity"],
+                    "latency_ms": sensors[board]["latency_ms"],
+                }
+                for board, cfg in BOARDS.items()
+            },
+            "timestamp": iso_now()
+        })
 
 
 if __name__ == "__main__":
@@ -672,5 +807,8 @@ if __name__ == "__main__":
     logger.info("Iran time zone: Asia/Tehran (UTC+03:30)", extra={"category": "TIME"})
     logger.info("GitHub sync: %s", "enabled" if github_enabled() else "disabled", extra={"category": "SYNC"})
     logger.info("Outage reference: today 13:00–15:00 • Friday skipped", extra={"category": "OUTAGE"})
+    logger.info("Log file: %s (5MB rotation, 3 backups)", log_file, extra={"category": "SYS"})
+    logger.info("API auth: %s", "enabled" if API_KEY else "disabled", extra={"category": "AUTH"})
+    logger.info("WebSocket: enabled", extra={"category": "WS"})
     start_worker()
-    app.run(host=HOST, port=PORT, debug=False, threaded=True)
+    socketio.run(app, host=HOST, port=PORT, debug=False)
